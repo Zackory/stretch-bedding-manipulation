@@ -1,0 +1,61 @@
+#!/usr/bin/env python  
+
+#-------#
+# Node broadcasts the tf for the aruco tag on the top right of the bed with respect to map frame
+#-------#
+
+from __future__ import division, print_function
+import rospy
+import tf
+import tf2_msgs.msg
+import geometry_msgs.msg
+
+
+
+class BedTRTfBroadcaster:
+
+    def __init__(self, trans, rot):
+        self.pub_tf = rospy.Publisher("/tf", tf2_msgs.msg.TFMessage, queue_size=1)
+
+        while not rospy.is_shutdown():
+            # Run this loop at about 10Hz
+            rospy.sleep(0.1)
+            t = geometry_msgs.msg.TransformStamped()
+            t.header.frame_id = "map"
+            t.header.stamp = rospy.Time.now()
+            t.child_frame_id = "ref_top_right"
+            t.transform.translation.x = trans[0]
+            t.transform.translation.y = trans[1]
+            t.transform.translation.z = 0
+
+            t.transform.rotation.x = rot[0]
+            t.transform.rotation.y = rot[1]
+            t.transform.rotation.z = rot[2]
+            t.transform.rotation.w = rot[3]
+
+            tfm = tf2_msgs.msg.TFMessage([t])
+            self.pub_tf.publish(tfm)
+
+
+if __name__ == '__main__':
+    try:
+        rospy.init_node('locate_bed_top_right')
+
+        listener = tf.TransformListener()
+
+        rate = rospy.Rate(10.0)
+        bed_found = False
+        while not bed_found:
+            try:
+                # TODO: add a line to wait for the aruco to be detected and for transform to be computed
+                (trans,rot) = listener.lookupTransform('map', 'bed_top_right',rospy.Time(0))
+                print(trans, rot)
+                tfb = BedTRTfBroadcaster(trans, rot)
+                bed_found = True
+            except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+                continue
+
+        rospy.spin()
+
+    except KeyboardInterrupt:
+        rospy.loginfo('interrupt received, so shutting down')

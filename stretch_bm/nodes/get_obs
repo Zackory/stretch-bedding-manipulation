@@ -1,0 +1,201 @@
+#!/usr/bin/env python  
+
+#-------#
+# Captures observation in the real world with respect to the sim origin using ArUco tags placed on the right+left knees and elbows
+#   ArUco tag 8 = right knee
+#   ArUco tag 7 = left knee
+#   ArUco tag 5 = right forearm
+#   ArUco tag 6 = left forearm
+#
+# Observation is:
+#   [x pos r shin, y pos r shin, yaw r shin, x pos l shin, y pos l shin, yaw l shin, x pos r forearm, y pos r forearm, yaw r forearm, x pos l forearm, y pos l forearm, yaw l forearm]
+# Observation saved to pkl files (one for sim_to_real_bm node to use, another for archiving)
+#-------#
+
+from __future__ import division, print_function
+import rospy
+
+import math
+import argparse as ap
+import numpy as np
+
+import time
+import tf
+import hello_helpers.hello_misc as hm
+import pickle
+import os
+
+
+class ObservationNode(hm.HelloNode):
+
+    def __init__(self):
+        hm.HelloNode.__init__(self)
+        self.rate = 10.0
+        self.sim_origin_generated = False
+
+    def find_sim_origin(self, listener):
+        # move to initial position
+        head_angle = -3.5
+        delta_rad = 0.2
+        self.move_to_pose({'wrist_extension': 0.01, 'joint_wrist_pitch': 0.0, 'joint_wrist_yaw': 0, 'joint_wrist_roll': 0, 'joint_gripper_finger_left': 0})
+        self.move_to_pose({'joint_lift': 0.57, 'joint_head_pan': head_angle, 'joint_head_tilt': -0.6})
+
+        # pan camera until both the aruco tags at the top right and bottom left of the bed have been located - thus generating the sim origin
+        sim_origin_generated = False
+        while not sim_origin_generated:
+            head_angle += delta_rad
+            self.move_to_pose({'joint_head_pan': head_angle})
+            rospy.sleep(1.5)
+            try:
+                # TODO: add a line to wait for the aruco to be detected and for transform to be computed
+                listener.lookupTransform('sim_origin', 'map', rospy.Time(0))
+                sim_origin_generated = True
+            except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+                continue
+        self.move_to_pose({'joint_head_pan': 0})
+
+    def quaternion_to_euler(self, quarternion):
+        x, y, z, w = quarternion
+        t0 = +2.0 * (w * x + y * z)
+        t1 = +1.0 - 2.0 * (x * x + y * y)
+        X = math.atan2(t0, t1)
+
+        t2 = +2.0 * (w * y - z * x)
+        t2 = +1.0 if t2 > +1.0 else t2
+        t2 = -1.0 if t2 < -1.0 else t2
+        Y = math.asin(t2)
+
+        t3 = +2.0 * (w * z + x * y)
+        t4 = +1.0 - 2.0 * (y * y + z * z)
+        Z = math.atan2(t3, t4)
+
+        return [X, Y, Z]
+
+    def correct_orient_to_match_sim(self, pose):
+        # transform quaternion orientation of aruco tag to euler roll, pitch, yaw
+        position, orient = pose
+        corrected_orient = self.quaternion_to_euler(orient)
+        return [position, corrected_orient]
+
+    def get_observation_tfs(self, listener):
+        # move head to initial position
+        head_angle = -3.5
+        delta_rad = 0.2
+        self.move_to_pose({'joint_head_tilt': -0.7, 'joint_head_pan': head_angle})
+
+        limb_tfs = [[0]]*4
+
+        # pan camera until all aruco tags on the limbs have been located
+        # 'r_shin':'target_object8', 'l_shin':'target_object7', 'r_forearm':'target_object5', 'l_forearm':'target_object6'
+        all_tags_found = False
+        while not all_tags_found:
+            head_angle += delta_rad
+            self.move_to_pose({'joint_head_pan': head_angle})
+
+            rospy.sleep(1)
+
+            try:
+                limb_tfs[0] =listener.lookupTransform('sim_origin', 'target_object8', rospy.Time(0))
+            except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+                continue
+            
+            try:
+                limb_tfs[1] =listener.lookupTransform('sim_origin', 'target_object7', rospy.Time(0))
+            except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+                continue
+            
+            try:
+                limb_tfs[2] =listener.lookupTransform('sim_origin', 'target_object5', rospy.Time(0))
+            except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+                continue
+            
+            try:
+                limb_tfs[3] =listener.lookupTransform('sim_origin', 'target_object6', rospy.Time(0))
+            except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+                continue
+            
+            sum = 0
+            for i in limb_tfs:
+                sum += len(i)
+
+            if sum == 2*4:
+                all_tags_found = True
+
+        return limb_tfs
+    
+    def obs_tfs_to_12d(self, tf_r_shin, tf_l_shin, tf_r_forearm, tf_l_forearm):
+        # take information necessary for 12D observation vector from the tfs for each limb aruco tag
+        #   x position, y position, yaw for each limb
+        obs = tf_r_shin[0][0:2] + [-10*tf_r_shin[1][-1]] + tf_l_shin[0][0:2] + [-10*tf_l_shin[1][-1]] + tf_r_forearm[0][0:2] + [-10*tf_r_forearm[1][-1]] + tf_l_forearm[0][0:2] + [-10*tf_l_forearm[1][-1]]
+        return obs
+
+    def main(self, args):
+        hm.HelloNode.main(self, 'bm_test', 'bm_test', wait_for_first_pointcloud=False)
+        rate = rospy.Rate(self.rate)
+
+        listener = tf.TransformListener()
+
+        self.find_sim_origin(listener)
+
+        tf_r_shin, tf_l_shin, tf_r_forearm, tf_l_forearm = self.get_observation_tfs(listener)
+
+        # print('shins')
+        # print(tf_r_shin)
+        # print(tf_l_shin)
+        # print('forearm')
+        # print(tf_r_forearm)
+        # print(tf_l_forearm)
+
+        tf_r_shin = self.correct_orient_to_match_sim(tf_r_shin)
+        tf_l_shin = self.correct_orient_to_match_sim(tf_l_shin)
+        tf_r_forearm = self.correct_orient_to_match_sim(tf_r_forearm)
+        tf_l_forearm = self.correct_orient_to_match_sim(tf_l_forearm)
+
+        # print('shins')
+        # print(tf_r_shin)
+        # print(tf_l_shin)
+        # print('forearm')
+        # print(tf_r_forearm)
+        # print(tf_l_forearm)
+
+        observation = self.obs_tfs_to_12d(tf_r_shin, tf_l_shin, tf_r_forearm, tf_l_forearm)
+        print("observation")
+        print(observation)
+
+        # dump to file for the sim_to_real_bm node to use
+        pickle.dump(observation, open('/home/hello-robot/git/observation.pkl','wb'))
+
+
+        # archive observations
+        dir = os.path.join('/home/hello-robot/git','real_dc','tl_'+args.tl, 'pose_' + args.pose)
+        print(dir)
+        if not os.path.exists(dir):
+            os.makedirs(dir)
+        
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        # filename = 't_' + args.trial + '_observation' + timestamp +'.pkl'
+        filename = 'observation' + timestamp +'.pkl'
+        print(filename)
+        save_path = os.path.join(dir, filename)
+        print(save_path)
+
+        pickle.dump(observation, open(save_path,'wb'))
+
+        print('done')
+
+
+if __name__ == '__main__':
+    try:
+        # args for file naming for observation archiving
+        parser = ap.ArgumentParser(description='Bedding Manipulation Node')
+        parser.add_argument('--tl', default='tl_4', help='target limb')
+        parser.add_argument('--pose', default='0', help='pose')
+        # parser.add_argument('--trial', default='0', help='trial for the given pose')
+        # parser.add_argument('--save_path', default='0', help='path to save observation to')
+        
+        args, unknown = parser.parse_known_args()
+
+        node = ObservationNode()
+        node.main(args)
+    except KeyboardInterrupt:
+        rospy.loginfo('interrupt received, so shutting down')

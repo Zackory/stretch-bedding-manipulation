@@ -1,0 +1,365 @@
+#!/usr/bin/env python  
+
+#-------#
+# Execute grasp and release of blanket
+#   Stretch should be positioned at the bottom left corner of the bed with its base partially under the bed (if driven forward, driving towards the head of the bed)
+#   First, locates the ArUco tags on the bottom left and top right corners of the bed to find the sim origin
+#   Then, aligns in the x and y to the grasp location, lowers the lift til it makes contact, and grasps the blanket
+#   Lastly, the robot moves linearly between the grasp and release location (in steps) and releases the blanket
+#-------#
+
+from __future__ import division, print_function
+import rospy
+
+import threading
+import argparse as ap
+import numpy as np
+
+import tf
+import hello_helpers.hello_misc as hm
+from std_srvs.srv import Trigger, TriggerRequest, TriggerResponse
+import stretch_funmap.navigate as nv
+from sensor_msgs.msg import JointState
+
+class BeddingManipulationNode(hm.HelloNode):
+
+    def __init__(self):
+        hm.HelloNode.__init__(self)
+        self.rate = 10.0
+        self.sim_origin_generated = False
+        self.wrist_extension = 0.0
+        self.debug_directory = None
+        self.move_base = nv.MoveBase(self, self.debug_directory)
+        self.joint_states = None
+        self.joint_states_lock = threading.Lock()
+        self.lift_position = None
+        self.wrist_position = None
+        self.wrist_roll = None
+        self.wrist_pitch = None
+        self.wrist_pitch_effort = None
+        self.wrist_yaw = None
+        self.bed_height = 0.58
+        self.delta_z = 0.4
+    
+    def joint_states_callback(self, joint_states):
+        with self.joint_states_lock: 
+            self.joint_states = joint_states
+        wrist_position, wrist_velocity, wrist_effort = hm.get_wrist_state(joint_states)
+        self.wrist_position = wrist_position
+        lift_position, lift_velocity, lift_effort = hm.get_lift_state(joint_states)
+        self.lift_position = lift_position
+        dex_wrist_state = self.get_dex_wrist_state(joint_states)
+        self.wrist_roll, self.wrist_pitch, self.wrist_yaw = dex_wrist_state[0]
+        self.wrist_pitch_effort = dex_wrist_state[2][1]
+
+    def get_dex_wrist_state(self, joint_states):
+        # get state of the dex wrist in the joint states callback
+        dex_wrist = ['joint_wrist_roll', 'joint_wrist_pitch', 'joint_wrist_yaw']
+        positions = []
+        velocities = []
+        efforts = []
+        for joint_name in dex_wrist:
+            i = joint_states.name.index(joint_name)
+            positions.append(joint_states.position[i])
+            velocities.append(joint_states.velocity[i])
+            efforts.append(joint_states.effort[i])
+        return positions, velocities, efforts
+
+    def find_sim_origin(self, listener):
+        # move to initial position
+        head_angle = -3.5
+        delta_rad = 0.2
+        self.move_to_pose({'joint_lift': 1})
+        self.move_to_pose({'wrist_extension': 0.01, 'joint_wrist_pitch': 0.0, 'joint_wrist_yaw': 0, 'joint_wrist_roll': np.pi, 'joint_gripper_finger_left': 0})
+        self.move_to_pose({'joint_lift': 0.57, 'joint_head_pan': head_angle, 'joint_head_tilt': -0.6})
+
+        # pan camera until both the aruco tags at the top right and bottom left of the bed have been located - thus generating the sim origin
+        sim_origin_generated = False
+        while not sim_origin_generated:
+            head_angle += delta_rad
+            self.move_to_pose({'joint_head_pan': head_angle})
+            rospy.sleep(1.5)
+            try:
+                # TODO: add a line to wait for the aruco to be detected and for transform to be gotten
+                listener.lookupTransform('sim_origin', 'map', rospy.Time(0))
+                sim_origin_generated = True
+            except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+                continue
+            if head_angle > 2:
+                print("origin not found")
+                exit()
+        self.move_to_pose({'joint_head_pan': 0})
+    
+    def align_to_sim_origin(self):
+        # Find the robot's current pose in the sim_origin frame.
+        xya, timestamp = self.get_robot_floor_pose_xya(floor_frame='sim_origin')
+        robot_ang = xya[2]
+        align_arm_ang = robot_ang + (np.pi/2.0)
+
+        # Find the angle that the robot should turn in order
+        # to point toward the next waypoint.
+        turn_ang = hm.angle_diff_rad(0, align_arm_ang)
+
+        # Command the robot to turn to point to the next
+        # waypoint.
+        at_goal = self.move_base.turn(turn_ang, publish_visualizations=True)
+        if not at_goal:
+            message_text = 'Failed to reach turn goal.'
+            rospy.loginfo(message_text)
+            success=False
+            message=message_text
+        else:
+            success = True
+            message = 'Aligned with sim origin'
+
+
+    def elevate_lift(self, listener):
+        # move lift to maintain gripper distance of 40cm from the top of the bed
+        lifted_to_delta_z = False
+        alignment_attempts = 1
+        while not lifted_to_delta_z:
+            try:
+                # 'link_arm_l0'
+                gripper_pos, gripper_orient = listener.lookupTransform('sim_origin', 'link_gripper_fingertip_right', rospy.Time(0))
+                distance_to_lift = (self.delta_z + self.bed_height) - gripper_pos[2] + 0.05
+                new_lift_pos = self.lift_position + distance_to_lift
+
+                if alignment_attempts > 3:
+                    print("max alignment attempts reached: z")
+                    break
+                if abs(distance_to_lift) <= 0.01:
+                    lifted_to_delta_z = True
+                    # print('aligned z')
+                else:
+                    self.move_to_pose({'joint_lift': new_lift_pos})
+                    rospy.sleep(1)
+                    alignment_attempts += 1
+                
+            except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+                continue
+
+    def align_pose_y(self, listener, loc):
+        # align gripper with given location in the y dimension
+        inline_with_loc = False
+        alignment_attempts = 1
+        
+        # attempt to align 3 times before giving up
+        while not inline_with_loc:
+            try:
+                gripper_pos, gripper_orient = listener.lookupTransform('sim_origin', 'link_gripper_fingertip_right', rospy.Time(0))
+                grasp_pos, grasp_orient = listener.lookupTransform('sim_origin', loc, rospy.Time(0))
+
+                distance_to_travel_y = np.linalg.norm(gripper_pos[1]-grasp_pos[1])
+                distance_to_travel_y = -1*distance_to_travel_y if gripper_pos[1] < grasp_pos[1] else distance_to_travel_y
+
+                if alignment_attempts > 3:
+                    print("max alignment attempts reached: y")
+                    break
+
+                if abs(distance_to_travel_y) <= 0.01:
+                    inline_with_loc = True
+                    # print('aligned y')
+                else:
+                    self.move_to_pose({'translate_mobile_base': distance_to_travel_y})
+                    rospy.sleep(1)
+                    alignment_attempts += 1
+                
+            except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+                continue
+
+    def align_pose_x(self, listener, loc):
+         # align gripper with given location in the x dimension
+        inline_with_loc = False
+        alignment_attempts = 1
+
+        # attempt to align 3 times before giving up
+        while not inline_with_loc:
+            try:
+                gripper_pos, gripper_orient = listener.lookupTransform('sim_origin', 'link_gripper_fingertip_right', rospy.Time(0))
+                grasp_pos, grasp_orient = listener.lookupTransform('sim_origin', loc, rospy.Time(0))
+
+                distance_to_travel_x = np.linalg.norm(gripper_pos[0]-grasp_pos[0])
+                distance_to_travel_x = -1*distance_to_travel_x  if gripper_pos[0] < grasp_pos[0] else distance_to_travel_x
+
+                if alignment_attempts > 3:
+                    print("max alignment attempts reached: x")
+                    break
+
+                if abs(distance_to_travel_x) <= 0.01:
+                    inline_with_loc = True
+                    # print('aligned x')
+
+                else:
+                    # if location to reach to is outside the minimum/maximum extension of the wrist, adjust pitch, yaw to reach the point
+
+                    change_pitch = self.determine_dex_wrist_yaw(distance_to_travel_x)
+                    if change_pitch:
+                        print("change pitch")
+                        delta_rad = self.get_wrist_pitch_rad(distance_to_travel_x)
+                        #print(delta_rad)
+                        self.move_to_pose({'joint_wrist_pitch': self.wrist_position-delta_rad})
+                    else:
+                        print("change extension")
+                        self.wrist_extension += distance_to_travel_x
+                        self.move_to_pose({'wrist_extension': self.wrist_extension})
+                    rospy.sleep(1)
+                    alignment_attempts += 1
+                
+            except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+                continue
+
+    def get_wrist_pitch_rad(self, distance_to_travel_x):
+        # determine pitch of the wrist needed to reach a given x position
+        gripper_len = 0.28
+        delta_rad = np.arcsin(abs(distance_to_travel_x)/gripper_len)
+        # print(delta_rad)
+        return delta_rad
+
+    def path_from_grasp_to_release(self, listener):
+        # move linearly from grasp to release location in small steps
+        at_release_loc = False
+        alignment_attempts = 1
+
+        # attempt to align 3 times before giving up
+        while not at_release_loc:
+            try:
+                gripper_pos, gripper_orient = listener.lookupTransform('sim_origin', 'link_gripper_fingertip_right', rospy.Time(0))
+                release_pos, release_orient = listener.lookupTransform('sim_origin', 'release', rospy.Time(0))
+
+                distance_to_travel_y = np.linalg.norm(gripper_pos[1]-release_pos[1])
+                distance_to_travel_y = -1*distance_to_travel_y if gripper_pos[1] < release_pos[1] else distance_to_travel_y
+
+                distance_to_travel_x = np.linalg.norm(gripper_pos[0]-release_pos[0])
+                distance_to_travel_x = -1*distance_to_travel_x  if gripper_pos[0] < release_pos[0] else distance_to_travel_x
+
+                # determine the number of steps to take to travel the given x, y distance if travel no more than 3cm in each step
+                travel_dist = np.array([distance_to_travel_y, distance_to_travel_x])
+                # print(travel_dist)
+                num_steps = int(np.abs(travel_dist//0.03).max())
+                # print(num_steps)
+                
+                delta_y, delta_x = travel_dist/num_steps
+                # print("delta_y, delta_x", delta_y, delta_x)
+
+                if alignment_attempts > 3:
+                    print("max alignment attempts reached: x, y linear path")
+                    break
+
+                if abs(distance_to_travel_x) <= 0.02 and abs(distance_to_travel_y) <= 0.02:
+                    at_release_loc = True
+                    print('aligned x')
+
+                else:
+                    for i in range(num_steps):
+                        rospy.sleep(0.1)
+                        self.align_to_sim_origin()
+
+                        # if x location to reach to is outside the minimum/maximum extension of the wrist, adjust pitch to align in the x
+                        change_pitch = self.determine_dex_wrist_yaw(delta_x)
+                        print(change_pitch, self.wrist_pitch)
+                        if self.wrist_pitch > -1.55 and not change_pitch:
+                            # adjust the wrist pitch to be perpendicular to the bed before extending the wrist to align in the x
+                            delta_rad = self.get_wrist_pitch_rad(delta_x)
+                            self.move_to_pose({'translate_mobile_base': delta_y,'joint_wrist_pitch': self.wrist_pitch-delta_rad})
+                            self.elevate_lift(listener)
+                        elif change_pitch:
+                            delta_rad = self.get_wrist_pitch_rad(delta_x)
+                            print(self.wrist_pitch+delta_rad)
+                            self.move_to_pose({'translate_mobile_base': (delta_y, 60),'joint_wrist_pitch': (self.wrist_pitch+delta_rad, -20)}, custom_contact_thresholds = True)
+                            self.elevate_lift(listener)
+                        else:
+                            self.wrist_extension += delta_x
+                            self.move_to_pose({'translate_mobile_base': delta_y, 'wrist_extension': self.wrist_extension})
+                    alignment_attempts += 1
+
+            except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+                continue
+
+    def lower_wrist_until_contact(self):
+        rospy.loginfo('lower_tool_until_contact')
+        trigger_request = TriggerRequest() 
+        trigger_result = self.trigger_lower_until_contact_service(trigger_request)
+        rospy.loginfo('trigger_result = {0}'.format(trigger_result))
+
+    def grasp_blanket(self):
+        self.contact_lift_position = self.lift_position
+        self.move_to_pose({'joint_lift': self.contact_lift_position+0.03})
+        self.move_to_pose({'joint_gripper_finger_left': 0.4})
+        rospy.sleep(2)
+        self.move_to_pose({'joint_lift': self.contact_lift_position+0.01})
+        self.move_to_pose({'joint_gripper_finger_left': -0.3})
+        rospy.sleep(2)
+
+    def move_to_grasp_loc(self, listener, loc):
+        # move to inital position
+        self.align_to_sim_origin()
+        self.move_to_pose({'joint_lift': 1})
+        self.move_to_pose({'joint_wrist_pitch': -1.8})
+
+        # align to y, then to x (not linear movement from current position to grasp location)
+        self.align_pose_y(listener, loc)
+        self.align_pose_x(listener, loc)
+
+        # lower the lift to grasp the blanket
+        print("--- LOWERING WRIST TO CONTACT ---")
+        self.lower_wrist_until_contact()
+        print("--- GRASPING BLANKET ---")
+        self.grasp_blanket()
+
+    def determine_dex_wrist_yaw(self, distance_to_travel_x):
+        # determine if the wrist yaw needs to change to pitch to the given x location
+        change_pitch = False
+        if self.wrist_position < 0.01 and distance_to_travel_x < -0.01:
+            self.move_to_pose({'joint_wrist_yaw': np.pi, 'joint_wrist_roll': 0})
+            change_pitch = True
+            #self.move_to_pose({'joint_wrist_pitch': 0})
+        elif self.wrist_position > 0.51 and distance_to_travel_x > 0.01:
+            #self.move_to_pose({'joint_wrist_pitch': -np.pi/2})
+            self.move_to_pose({'joint_wrist_yaw': 0, 'joint_wrist_roll': np.pi})
+            change_pitch = True
+            #self.move_to_pose({'joint_wrist_pitch': 0})
+        return change_pitch
+
+    def main(self):
+        hm.HelloNode.main(self, 'bm_test', 'bm_test', wait_for_first_pointcloud=False)
+        rate = rospy.Rate(self.rate)
+
+        self.joint_states_subscriber = rospy.Subscriber('/stretch/joint_states', JointState, self.joint_states_callback)
+
+        rospy.wait_for_service('/funmap/trigger_lower_until_contact')
+        rospy.loginfo('Node ' + self.node_name + ' connected to /funmap/trigger_lower_until_contact.')
+        self.trigger_lower_until_contact_service = rospy.ServiceProxy('/funmap/trigger_lower_until_contact', Trigger)
+
+        listener = tf.TransformListener()
+
+        #rospy.sleep(10)
+        print("--- FINDING SIM ORIGIN ---")
+        self.find_sim_origin(listener)
+        print("--- SIM ORIGIN FOUND---")
+        self.align_to_sim_origin()
+        
+        print("--- MOVING TO GRASP LOCATION ---")
+        self.move_to_grasp_loc(listener, 'grasp')
+
+        print("--- ELEVATING LIFT ---")
+        self.elevate_lift(listener)
+
+        print("--- MOVING TO RELEASE LOCATION ---")
+        self.path_from_grasp_to_release(listener)
+
+        print("--- RELEASING BLANKET ---")
+        self.move_to_pose({'joint_gripper_finger_left': 0.2})
+
+        print('done')
+
+
+if __name__ == '__main__':
+    try:
+        parser = ap.ArgumentParser(description='Bedding Manipulation Node')
+
+        args, unknown = parser.parse_known_args()
+
+        node = BeddingManipulationNode()
+        node.main()
+    except KeyboardInterrupt:
+        rospy.loginfo('interrupt received, so shutting down')
